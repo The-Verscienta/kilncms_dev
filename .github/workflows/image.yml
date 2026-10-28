@@ -1,0 +1,135 @@
+name: Image
+
+# Builds kilncms.dev's image: a kiln_cms checkout with this repo's overlay laid
+# on top, built with kiln_cms's own Dockerfile, unchanged. Coolify runs the
+# pushed image. Nothing here copies the Dockerfile, so a core change to the
+# build reaches kilncms.dev on the next run with no edit here.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      kiln_ref:
+        description: kiln_cms branch, tag or commit to build
+        required: false
+        default: main
+
+concurrency:
+  group: image
+  cancel-in-progress: true
+
+env:
+  KILN_REF: ${{ inputs.kiln_ref || 'main' }}
+  IMAGE: ghcr.io/the-verscienta/kilncms-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      kiln_sha: ${{ steps.kiln.outputs.sha }}
+
+    steps:
+      - name: Check out kiln_cms
+        uses: actions/checkout@v5
+        with:
+          repository: The-Verscienta/kiln_cms
+          ref: ${{ env.KILN_REF }}
+          path: kiln
+
+      - name: Check out the overlay
+        uses: actions/checkout@v5
+        with:
+          path: overlay
+
+      # The two halves of an overlay, where the core Dockerfile reads them:
+      # - config/project_deps.exs is picked up by its optional COPY before
+      #   `mix deps.get`. No project.lock: the build seeds it from mix.lock.
+      # - project.exs goes in projects/<name>/, which `--build-arg PROJECT=`
+      #   installs as config/project.exs before `mix compile`.
+      - name: Lay the overlay on kiln_cms
+        id: kiln
+        run: |
+          set -eu
+          cp overlay/config/project_deps.exs kiln/config/project_deps.exs
+          mkdir -p kiln/projects/kilncms_dev
+          cp overlay/config/project.exs kiln/projects/kilncms_dev/project.exs
+          echo "sha=$(git -C kiln rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: ./kiln
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:kiln-${{ steps.kiln.outputs.sha }}-overlay-${{ github.sha }}
+          # GIT_SHA is the core commit: it is what /editor/system reports as
+          # the running Kiln. KILN_ML comes from the repository variable, empty
+          # (the lean build) unless set.
+          build-args: |
+            PROJECT=kilncms_dev
+            KILN_ML=${{ vars.KILN_ML }}
+            GIT_SHA=${{ steps.kiln.outputs.sha }}
+            BUILD_DATE=${{ steps.kiln.outputs.date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # The runner stage's layers are the Debian packages the image ships;
+          # a cache hit would replay an old apt run and miss security fixes
+          # (kiln_cms#2097). The builder stays cached.
+          no-cache-filters: runner
+
+      - name: Check the plugin made it into the release
+        run: |
+          set -eu
+          docker pull "$IMAGE:latest"
+          docker run --rm --entrypoint sh "$IMAGE:latest" -c \
+            'ls -d /app/lib/kiln_cloudinary-* && grep -q KilnCloudinary.Plugin /app/releases/*/sys.config'
+
+  deploy:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      # Optional: with no webhook configured the image is pushed and Coolify
+      # is redeployed by hand.
+      - name: Trigger the Coolify redeploy
+        env:
+          WEBHOOK_URL: ${{ secrets.COOLIFY_WEBHOOK_URL }}
+          COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "COOLIFY_WEBHOOK_URL is not set: image pushed, redeploy in Coolify by hand."
+            exit 0
+          fi
+          status=$(curl -s -o /tmp/out.txt -w "%{http_code}" -X POST "$WEBHOOK_URL" \
+            -H "Authorization: Bearer $COOLIFY_TOKEN")
+          cat /tmp/out.txt
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "::error::Coolify webhook answered $status"
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          {
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`$IMAGE:latest\` |"
+            echo "| kiln_cms | \`${{ needs.build.outputs.kiln_sha }}\` |"
+            echo "| Overlay | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          IMAGE: ${{ env.IMAGE }}
